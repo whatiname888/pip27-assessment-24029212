@@ -4,6 +4,7 @@
 #include <chrono>
 #include <cstdint>
 #include <cstdlib>
+#include <functional>
 #include <iomanip>
 #include <iostream>
 #include <random>
@@ -227,7 +228,11 @@ int main(int argc, char** argv) {
         seed = static_cast<std::uint32_t>(std::strtoul(argv[1], nullptr, 10));
     }
     std::mt19937_64 generator(seed);
-    const auto configs = buildConfigs();
+    auto configs = buildConfigs();
+    if (argc > 2) {
+        configs.resize(std::min(configs.size(),
+                                static_cast<std::size_t>(std::strtoul(argv[2], nullptr, 10))));
+    }
 
     std::cout << "PIP2027 / T2 动态序列区间第 k 大 本地测评\n"
               << "用例数: " << configs.size() << "\n\n";

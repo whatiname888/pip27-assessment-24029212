@@ -365,7 +365,11 @@ int main(int argc, char** argv) {
     if (argc > 1) {
         seed = static_cast<std::uint32_t>(std::strtoul(argv[1], nullptr, 10));
     }
-    const auto cases = buildCases(seed);
+    auto cases = buildCases(seed);
+    if (argc > 2) {
+        cases.resize(std::min(cases.size(),
+                              static_cast<std::size_t>(std::strtoul(argv[2], nullptr, 10))));
+    }
     std::cout << "PIP2027 / T1 二分图最大权匹配 本地测评\n"
               << "用例数: " << cases.size() << "（含 400 组小规模对拍）\n\n";
     std::cout << std::right << std::setw(20) << "Case" << "  " << std::left
