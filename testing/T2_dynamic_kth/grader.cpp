@@ -62,6 +62,7 @@ struct Config {
     std::size_t operations;
     int value_span;               // 取值范围 [-value_span, value_span]
     std::size_t verify_stride;    // 抽验间隔，1 表示每个查询都核对
+    std::size_t pileup = 0;       // 额外插入的、落在初始值域之外的元素数
 };
 
 struct CaseResult {
@@ -85,13 +86,18 @@ std::vector<int> makeValues(std::mt19937_64* generator, std::size_t count,
     return values;
 }
 
+std::size_t gen_index(std::mt19937_64* generator, std::size_t bound) {
+    std::uniform_int_distribution<std::size_t> distribution(0, bound - 1);
+    return distribution(*generator);
+}
+
 CaseResult runCase(const Config& config, std::mt19937_64* generator) {
     CaseResult result;
     std::uniform_int_distribution<std::uint32_t> roll(0, 99);
     std::unordered_set<int> used;
     used.reserve(config.initial_size + config.operations / 2 + 16);
 
-    const std::vector<int> initial =
+    std::vector<int> initial =
         makeValues(generator, config.initial_size, config.value_span, &used);
     std::uniform_int_distribution<int> value_distribution(
         -config.value_span, config.value_span);
@@ -105,6 +111,26 @@ CaseResult runCase(const Config& config, std::mt19937_64* generator) {
         const auto stop = std::chrono::steady_clock::now();
         impl_ms +=
             std::chrono::duration<double, std::milli>(stop - start).count();
+    }
+
+    // 动态挤压：把大量元素插到初始值域之外的窄区间，使其落入同一值域桶，
+    // 用于检验候选规模超限时的兜底路径。
+    if (config.pileup > 0 && config.initial_size > 0) {
+        int lowest = initial.front();
+        for (int value : initial) {
+            lowest = std::min(lowest, value);
+        }
+        for (std::size_t i = 0; i < config.pileup; ++i) {
+            const int value = lowest - 1 - static_cast<int>(i);
+            used.insert(value);
+            const std::size_t index = gen_index(generator, brute.size() + 1);
+            const auto start = std::chrono::steady_clock::now();
+            sequence->insert(index, value);
+            const auto stop = std::chrono::steady_clock::now();
+            impl_ms +=
+                std::chrono::duration<double, std::milli>(stop - start).count();
+            brute.insert(index, value);
+        }
     }
 
     std::size_t query_seen = 0;
@@ -204,6 +230,7 @@ std::vector<Config> buildConfigs() {
                            1000, 1});
     }
     configs.push_back({"基础-空初始", 0, 1000, 1000, 1});
+    configs.push_back({"拓展2-集中值域", 5000000, 20000, 3000000, 100});
     configs.push_back({"基础-单元素", 1, 1000, 1000, 1});
     for (int i = 0; i < 3; ++i) {
         configs.push_back({"集中值域-" + std::to_string(i + 1), 20000, 3000,

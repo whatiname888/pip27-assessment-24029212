@@ -27,12 +27,19 @@ if(NOT STUDENT_SOURCES)
     message(FATAL_ERROR "考生 src/ 目录中没有找到 .cpp 文件")
 endif()
 
+# 选项 PIP27_FORCE_FALLBACK=ON 时压低候选规模上限，强制每个查询走兜底路径，
+# 用于验证兜底实现与主路径结果一致。
+option(PIP27_FORCE_FALLBACK "强制走候选退化兜底路径" OFF)
+
 add_library(candidate OBJECT ${STUDENT_SOURCES})
 target_compile_features(candidate PRIVATE cxx_std_17)
 target_compile_options(candidate PRIVATE -O2 -Wall -Wextra)
 target_include_directories(candidate PRIVATE
     "${CMAKE_CURRENT_LIST_DIR}/include"
     "${STUDENT_INCLUDE_ROOT}")
+if(PIP27_FORCE_FALLBACK)
+    target_compile_definitions(candidate PRIVATE PIP27_T2_MAX_CANDIDATES=1)
+endif()
 
 add_executable(grader
     grader.cpp
