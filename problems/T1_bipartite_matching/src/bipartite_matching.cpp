@@ -1,5 +1,7 @@
 #include "bipartite_matching.hpp"
 
+#include "cost_scaling.hpp"
+
 #include <algorithm>
 #include <cstdint>
 #include <limits>
@@ -368,7 +370,13 @@ std::vector<std::int32_t> BipartiteMatcher::maximumWeightMatching() const {
     }
 
     std::vector<std::int32_t> answer;
-    impl.solveMatching(&answer);
+    // 快路径：费用缩放 push-relabel，整数环论证 + 线性校验收口；
+    // 预算耗尽或校验不通过时回退确定性 SSP。
+    pip27::CostScalingMatcher cost_scaling(impl.left_count, impl.right_count,
+                                           impl.edges);
+    if (!cost_scaling.solve(&answer)) {
+        impl.solveMatching(&answer);
+    }
 
     // 有边时必须返回非空匹配。允许空匹配时最优解为空，说明所有匹配权重 <= 0：
     // 此时权重最大的单条边就是最优非空匹配（零权边同样满足最优）。
