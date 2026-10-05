@@ -147,8 +147,8 @@ struct BipartiteMatcher::Impl {
         }
 
         // 每条输入边拆成正反两条弧，先统计各顶点出度，再按尾顶点摊平。
-        std::vector<int> starts(static_cast<std::size_t>(node_count) + 1, 0);
-        auto count_tail = [&starts](int tail) {
+        starts.assign(static_cast<std::size_t>(node_count) + 1, 0);
+        auto count_tail = [this](int tail) {
             ++starts[static_cast<std::size_t>(tail) + 1];
         };
         for (int left = 0; left < static_cast<int>(left_count); ++left) {
@@ -195,7 +195,6 @@ struct BipartiteMatcher::Impl {
         for (int right = 0; right < static_cast<int>(right_count); ++right) {
             add_arc(left_end + right, sink, 0);
         }
-        this->starts.assign(starts.begin(), starts.end());
 
         // 初始势函数：源点、左部取 0，右部取所有入边费用的最小值，
         // 汇点取各右部势与 0 的较小者，保证归约费用非负。
