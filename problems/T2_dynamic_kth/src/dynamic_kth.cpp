@@ -33,6 +33,15 @@ inline int clampInt(int value, int low, int high) {
     return std::max(low, std::min(high, value));
 }
 
+// 提示编译器预取内存，减少逐块收集候选时的缓存缺失。
+inline void prefetchBlock(const void* address) {
+#if defined(__GNUC__) || defined(__clang__)
+    __builtin_prefetch(address, 0, 1);
+#else
+    (void)address;
+#endif
+}
+
 }  // namespace
 
 struct DynamicKth::Impl {
@@ -46,6 +55,11 @@ struct DynamicKth::Impl {
     std::size_t length_ = 0;
     int bucket_count_ = 256;
     std::size_t block_target_ = 256;
+    // 值域桶按初始值的实际分布划分（任何划分都不影响正确性，只影响均衡），
+    // 避免取值集中在窄区间时候选过多；超出初始值域的值归入端点桶。
+    std::int64_t value_min_ = kMinValue;
+    std::uint64_t value_span_ = 0;
+    std::uint64_t bucket_factor_ = 0;
     // prefix_[b * (block_count + 1) + i] = 前 i 块中桶 b 的元素个数。
     std::vector<std::uint32_t> prefix_;
     std::vector<std::uint8_t> dirty_;
@@ -54,7 +68,12 @@ struct DynamicKth::Impl {
     std::vector<std::uint32_t> partial_counts_;
     std::vector<int> candidates_;
 
+    // 候选规模上限；测试期可压低该值以强制走兜底路径验证其正确性。
+#ifdef PIP27_T2_MAX_CANDIDATES
+    static constexpr std::size_t kMaxCandidates = PIP27_T2_MAX_CANDIDATES;
+#else
     static constexpr std::size_t kMaxCandidates = 262144;
+#endif
 
     explicit Impl(const std::vector<int>& initial) {
         // 参数由序列规模标定（实测最优）：块大小取 2.75*sqrt(N)，值域桶数取
@@ -67,6 +86,34 @@ struct DynamicKth::Impl {
         bucket_count_ = clampInt(static_cast<int>(root), 64, 4096);
         dirty_.assign(static_cast<std::size_t>(bucket_count_), 1);
         partial_counts_.assign(static_cast<std::size_t>(bucket_count_), 0);
+
+        if (!initial.empty()) {
+            // 抽样取 0.02%~99.98% 分位数作为桶值域：极端离群值只会落进端点
+            // 桶，不会把整条值域拉宽导致桶失衡。分桶只是分组，任何划分都不
+            // 影响正确性，只影响查询代价的均衡。
+            const std::size_t sample_size = std::min<std::size_t>(initial.size(), 32768);
+            std::vector<int> sample;
+            sample.reserve(sample_size);
+            const std::size_t stride =
+                std::max<std::size_t>(1, initial.size() / sample_size);
+            for (std::size_t i = 0; i < initial.size() && sample.size() < sample_size;
+                 i += stride) {
+                sample.push_back(initial[i]);
+            }
+            std::sort(sample.begin(), sample.end());
+            const std::size_t trim =
+                std::max<std::size_t>(1, sample.size() / 4096);
+            value_min_ = sample[trim];
+            const std::int64_t high =
+                sample[sample.size() - 1 - trim];
+            value_span_ = static_cast<std::uint64_t>(
+                std::max<std::int64_t>(1, high - value_min_ + 1));
+        }
+        if (value_span_ == 0) {
+            value_span_ = static_cast<std::uint64_t>(kMaxValue - kMinValue) + 1;
+        }
+        bucket_factor_ =
+            (static_cast<std::uint64_t>(bucket_count_) << 32) / value_span_;
 
         const std::size_t count = initial.size();
         for (std::size_t begin = 0; begin < count; begin += block_target_) {
@@ -86,11 +133,14 @@ struct DynamicKth::Impl {
     }
 
     int bucketOf(int value) const {
-        const std::uint64_t offset =
-            static_cast<std::uint64_t>(static_cast<std::int64_t>(value) -
-                                       kMinValue);
+        std::int64_t offset = static_cast<std::int64_t>(value) - value_min_;
+        if (offset < 0) {
+            offset = 0;
+        } else if (static_cast<std::uint64_t>(offset) >= value_span_) {
+            offset = static_cast<std::int64_t>(value_span_ - 1);
+        }
         return static_cast<int>(
-            (offset * static_cast<std::uint64_t>(bucket_count_)) >> 31);
+            (static_cast<std::uint64_t>(offset) * bucket_factor_) >> 32);
     }
 
     void rebuildBlock(Block* block) {
@@ -298,16 +348,22 @@ struct DynamicKth::Impl {
             return candidates_[index];
         }
 
-        // 两端残块元素直接扫描，同时统计它们的桶分布。
+        // 两端残块元素直接扫描，同时统计它们的桶分布；若某端整块落在区间内，
+        // 直接交给桶前缀和处理，避免逐元素扫描整块。
         partial_.clear();
         std::fill(partial_counts_.begin(), partial_counts_.end(), 0);
-        {
+        const std::size_t tail_length = blocks_[right_block].values.size();
+        const bool head_scanned = left_offset != 0;
+        const bool tail_scanned = right_offset + 1 != tail_length;
+        if (head_scanned) {
             const Block& head = blocks_[left_block];
             for (std::size_t i = left_offset; i < head.values.size(); ++i) {
                 const int value = head.values[i];
                 partial_.push_back(value);
                 ++partial_counts_[static_cast<std::size_t>(bucketOf(value))];
             }
+        }
+        if (tail_scanned) {
             const Block& tail = blocks_[right_block];
             for (std::size_t i = 0; i <= right_offset; ++i) {
                 const int value = tail.values[i];
@@ -316,8 +372,10 @@ struct DynamicKth::Impl {
             }
         }
 
-        const std::size_t first_full = left_block + 1;
-        const std::size_t last_full = right_block - 1;
+        const std::size_t first_full =
+            head_scanned ? left_block + 1 : left_block;
+        const std::size_t last_full =
+            tail_scanned ? right_block - 1 : right_block;
         const std::size_t rows = blocks_.size() + 1;
         const std::uint32_t* base = prefix_.data();
 
@@ -349,6 +407,12 @@ struct DynamicKth::Impl {
             }
         }
         for (std::size_t i = first_full; i <= last_full; ++i) {
+            if (i + 2 <= last_full) {
+                // 提前预取后续块的 offsets 与有序数组。
+                prefetchBlock(blocks_[i + 2].offsets.data() +
+                              static_cast<std::size_t>(target_bucket));
+                prefetchBlock(blocks_[i + 2].sorted.data());
+            }
             const Block& block = blocks_[i];
             const std::size_t begin =
                 block.offsets[static_cast<std::size_t>(target_bucket)];
