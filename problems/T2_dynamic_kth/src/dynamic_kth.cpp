@@ -4,6 +4,7 @@
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
+#include <functional>
 #include <memory>
 #include <vector>
 
@@ -233,6 +234,7 @@ struct DynamicKth::Impl {
             if (blocks_.empty()) {
                 blocks_.emplace_back();
                 rebuildBlock(&blocks_.back());
+                resizePrefix();  // 块数变化，桶前缀和需按新行数重建
             }
             block_index = blocks_.size() - 1;
             offset = blocks_[block_index].values.size();
