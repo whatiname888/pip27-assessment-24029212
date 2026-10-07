@@ -1,0 +1,108 @@
+#pragma once
+
+#include <cstddef>
+#include <cstdint>
+#include <vector>
+
+namespace pip27 {
+
+// 动态小波矩阵（wavelet matrix），4 位数字分层、共 8 层。
+//
+// 值映射为无符号 32 位键（异或符号位，保持大小序），自高位到低位每层取
+// 4 位数字；第 L+1 层是第 L 层按该数字稳定划分（小者在前）的结果。区间
+// 第 k 大逐层下探，每层只需两次前缀计数即可确定答案的 4 位并收缩区间。
+//
+// 每层数字序列的存储（这是性能关键）：
+//   * 定长块数组：每块 512 个数字，块内每 64 个数字记录累计计数行，
+//     块内前缀计数只需一次行查表加至多 63 次扫描；
+//   * 块间用扁平 Fenwick 聚合（每结点 16 路计数 + 符号数），前缀计数
+//     只走 log(块数)≈12 步且全部命中缓存。
+// 单次 rank 约百纳秒量级，插入/删除只在块内搬移一段数字并更新两条
+// Fenwick 路径，均摊代价低。存储量 O(N)：N=1e6 时约 12MB。
+class WaveletMatrix {
+public:
+    explicit WaveletMatrix(const std::vector<int>& initial);
+
+    void insert(std::size_t position, int value);
+    void erase(std::size_t position);
+    void replace(std::size_t position, int value);
+    int kthLargest(std::size_t left, std::size_t right, std::size_t k) const;
+
+    std::size_t size() const { return size_; }
+
+private:
+    static constexpr int kLevels = 8;
+    static constexpr int kChunkSymbols = 4096;   // 每块符号数
+    static constexpr int kRowSymbols = 64;      // 累计计数行粒度
+    static constexpr int kRows = kChunkSymbols / kRowSymbols;
+    static constexpr int kSplitSize = kChunkSymbols * 3 / 4;
+    static constexpr int kMergeSize = kChunkSymbols / 4;
+
+    struct Chunk {
+        std::uint16_t used = 0;
+        std::uint8_t digits[kChunkSymbols] = {0};
+        // rows[d][g] = 前 (g+1)*kRowSymbols 个数字中数字 d 的个数。
+        // 按数字优先存放: 插入/删除要给某数字的所有后续行增减计数,
+        // 转置后是连续内存,可用紧凑循环乃至向量化。
+        std::uint16_t rows[16][kRows] = {{0}};
+    };
+
+    struct Level {
+        std::vector<Chunk> chunks;
+        // 扁平 Fenwick: node*17+0 = 符号数, node*17+1+d = 数字 d 计数。
+        std::vector<std::uint32_t> fenwick;
+        std::uint32_t total[16] = {0};
+        std::uint32_t size = 0;
+
+        std::size_t nodeCount() const { return chunks.size(); }
+    };
+
+    Level levels_[kLevels];
+    std::size_t size_ = 0;
+
+    // ---- 每层基础操作 ----
+    static void rebuildChunk(Chunk* chunk);
+    static void chunkPrefix(const Chunk& chunk, std::uint32_t count,
+                            std::uint32_t out[16]);
+    // 定位第 position 个符号所在块与块内偏移。
+    static void locate(const Level& level, std::uint32_t position,
+                       std::size_t* chunk_index, std::uint32_t* offset);
+    // [0, position) 的 16 路直方图。
+    static void prefixCounts(const Level& level, std::uint32_t position,
+                             std::uint32_t out[16]);
+    static std::uint32_t digitAt(const Level& level, std::uint32_t position);
+    // 一趟同时给出 [0,position) 直方图与 position 处数字。
+    static std::uint32_t prefixAndDigit(const Level& level,
+                                        std::uint32_t position,
+                                        std::uint32_t out[16]);
+    static void fenwickRebuild(Level* level);
+    static void fenwickAdd(Level* level, std::size_t chunk_index, int digit,
+                           int delta);
+    static void fenwickReplaceDigit(Level* level, std::size_t chunk_index,
+                                    int old_digit, int new_digit);
+
+    // 以下三个操作均假定 (chunk_index, offset) 已由调用方定位,省去重复查找。
+    void insertDigit(int level, std::size_t chunk_index, std::uint32_t offset,
+                     std::uint32_t digit);
+    std::uint32_t eraseDigit(int level, std::size_t chunk_index,
+                             std::uint32_t offset);
+    void replaceDigit(int level, std::size_t chunk_index, std::uint32_t offset,
+                      std::uint32_t old_digit, std::uint32_t new_digit);
+    // 定位并给出 [0,position) 直方图与 position 处数字。
+    std::uint32_t locateAndPrefix(int level, std::uint32_t position,
+                                  std::size_t* chunk_index,
+                                  std::uint32_t* offset,
+                                  std::uint32_t out[16]) const;
+
+    static std::uint32_t digitOf(std::uint32_t key, int level) {
+        return (key >> (28 - 4 * level)) & 0xfu;
+    }
+    static std::uint32_t keyOf(int value) {
+        return static_cast<std::uint32_t>(value) ^ 0x80000000u;
+    }
+    static int valueOfKey(std::uint32_t key) {
+        return static_cast<int>(key ^ 0x80000000u);
+    }
+};
+
+}  // namespace pip27
