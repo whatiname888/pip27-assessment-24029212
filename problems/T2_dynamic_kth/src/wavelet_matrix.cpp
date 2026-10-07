@@ -1,6 +1,7 @@
 #include "wavelet_matrix.hpp"
 
 #include <algorithm>
+#include <cstring>
 #include <iterator>
 #include <cstddef>
 #include <cstdint>
@@ -11,6 +12,24 @@ namespace {
 
 inline std::uint32_t lowBit(std::size_t value) {
     return static_cast<std::uint32_t>(value & ~(value - 1));
+}
+
+// 累计行的计数不超过块容量(<=4096),可用 64 位打包并行增减:
+// 一条指令同时给 4 个 uint16 计数加减 1。
+inline void bumpRows(std::uint16_t* rows, int from, int to, int delta) {
+    // 每个 16 位槽同时加减 1。槽值不会回绕: 递增时计数 <= 块容量,
+    // 递减时被改符号本就计入该行、计数 >= 1,不会跨槽借位。
+    constexpr std::uint64_t kLanes = 0x0001000100010001ULL;
+    int g = from;
+    for (; g + 4 <= to; g += 4) {
+        std::uint64_t packed;
+        std::memcpy(&packed, rows + g, sizeof packed);
+        packed = delta > 0 ? packed + kLanes : packed - kLanes;
+        std::memcpy(rows + g, &packed, sizeof packed);
+    }
+    for (; g < to; ++g) {
+        rows[g] = static_cast<std::uint16_t>(rows[g] + delta);
+    }
 }
 
 }  // namespace
@@ -273,10 +292,8 @@ void WaveletMatrix::replaceDigit(int level, std::size_t chunk_index,
     chunk.digits[offset] = static_cast<std::uint8_t>(new_digit);
     // 累计行只需改两种数字的计数。
     const int first_row = static_cast<int>(offset / kRowSymbols);
-    for (int g = first_row; g < kRows; ++g) {
-        --chunk.rows[old_digit][g];
-        ++chunk.rows[new_digit][g];
-    }
+    bumpRows(chunk.rows[old_digit], first_row, kRows, -1);
+    bumpRows(chunk.rows[new_digit], first_row, kRows, +1);
     fenwickReplaceDigit(&target, chunk_index, static_cast<int>(old_digit),
                         static_cast<int>(new_digit));
     --target.total[old_digit];
@@ -329,9 +346,7 @@ void WaveletMatrix::insertDigit(int level, std::size_t chunk_index,
     // 符号要从该行扣除,否则行计数会虚增。
     std::uint16_t* digit_rows = chunk.rows[digit];
     const std::uint32_t first_row = offset / kRowSymbols;
-    for (int g = static_cast<int>(first_row); g < kRows; ++g) {
-        ++digit_rows[g];
-    }
+    bumpRows(digit_rows, static_cast<int>(first_row), kRows, +1);
     for (int g = 0; g < kRows; ++g) {
         const std::uint32_t boundary =
             (static_cast<std::uint32_t>(g) + 1) * kRowSymbols;
@@ -357,9 +372,7 @@ std::uint32_t WaveletMatrix::eraseDigit(int level, std::size_t chunk_index,
     // 删除同理: 被前移拉进某行上界内的符号要补回该行。
     std::uint16_t* digit_rows = chunk.rows[digit];
     const std::uint32_t first_row = offset / kRowSymbols;
-    for (int g = static_cast<int>(first_row); g < kRows; ++g) {
-        --digit_rows[g];
-    }
+    bumpRows(digit_rows, static_cast<int>(first_row), kRows, -1);
     for (int g = 0; g < kRows; ++g) {
         const std::uint32_t boundary =
             (static_cast<std::uint32_t>(g) + 1) * kRowSymbols;
