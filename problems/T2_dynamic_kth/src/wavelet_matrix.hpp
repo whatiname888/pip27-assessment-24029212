@@ -49,8 +49,11 @@ private:
 
     struct Level {
         std::vector<Chunk> chunks;
-        // 扁平 Fenwick: node*17+0 = 符号数, node*17+1+d = 数字 d 计数。
-        std::vector<std::uint32_t> fenwick;
+        // 两条扁平 Fenwick: 紧凑的符号数(定位用,常驻一二级缓存)、
+        // 16 路数字计数(前缀计数用)。定位走紧凑数组,缓存足迹从
+        // 数十 KB 降到数 KB,是查询与更新共同的热路径。
+        std::vector<std::uint32_t> size_fenwick;
+        std::vector<std::uint32_t> count_fenwick;
         std::uint32_t total[16] = {0};
         std::uint32_t size = 0;
 

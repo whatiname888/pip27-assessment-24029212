@@ -71,20 +71,24 @@ void WaveletMatrix::chunkPrefix(const Chunk& chunk, std::uint32_t count,
 
 void WaveletMatrix::fenwickRebuild(Level* level) {
     const std::size_t n = level->chunks.size();
-    level->fenwick.assign((n + 1) * 17, 0);
+    level->size_fenwick.assign(n + 1, 0);
+    level->count_fenwick.assign((n + 1) * 16, 0);
     for (std::size_t i = 0; i < n; ++i) {
-        std::uint32_t* node = level->fenwick.data() + (i + 1) * 17;
-        node[0] = level->chunks[i].used;
+        level->size_fenwick[i + 1] = level->chunks[i].used;
+        std::uint32_t* node = level->count_fenwick.data() + (i + 1) * 16;
         for (int d = 0; d < 16; ++d) {
-            node[1 + d] = level->chunks[i].rows[d][kRows - 1];
+            node[d] = level->chunks[i].rows[d][kRows - 1];
         }
     }
     for (std::size_t i = 1; i <= n; ++i) {
         const std::size_t parent = i + lowBit(i);
         if (parent <= n) {
-            std::uint32_t* target = level->fenwick.data() + parent * 17;
-            const std::uint32_t* source = level->fenwick.data() + i * 17;
-            for (int k = 0; k < 17; ++k) {
+            level->size_fenwick[parent] += level->size_fenwick[i];
+            std::uint32_t* target =
+                level->count_fenwick.data() + parent * 16;
+            const std::uint32_t* source =
+                level->count_fenwick.data() + i * 16;
+            for (int k = 0; k < 16; ++k) {
                 target[k] += source[k];
             }
         }
@@ -95,9 +99,8 @@ void WaveletMatrix::fenwickReplaceDigit(Level* level, std::size_t chunk_index,
                                         int old_digit, int new_digit) {
     const std::size_t n = level->chunks.size();
     for (std::size_t i = chunk_index + 1; i <= n; i += lowBit(i)) {
-        std::uint32_t* node = level->fenwick.data() + i * 17;
-        --node[1 + old_digit];
-        ++node[1 + new_digit];
+        --level->count_fenwick[i * 16 + old_digit];
+        ++level->count_fenwick[i * 16 + new_digit];
     }
 }
 
@@ -105,9 +108,8 @@ void WaveletMatrix::fenwickAdd(Level* level, std::size_t chunk_index,
                                int digit, int delta) {
     const std::size_t n = level->chunks.size();
     for (std::size_t i = chunk_index + 1; i <= n; i += lowBit(i)) {
-        std::uint32_t* node = level->fenwick.data() + i * 17;
-        node[0] += static_cast<std::uint32_t>(delta);
-        node[1 + digit] += static_cast<std::uint32_t>(delta);
+        level->size_fenwick[i] += static_cast<std::uint32_t>(delta);
+        level->count_fenwick[i * 16 + digit] += static_cast<std::uint32_t>(delta);
     }
 }
 
@@ -123,9 +125,9 @@ void WaveletMatrix::locate(const Level& level, std::uint32_t position,
     std::uint32_t remaining = position;
     for (step >>= 1; step > 0; step >>= 1) {
         const std::size_t next = index + step;
-        if (next <= n && level.fenwick[next * 17] <= remaining) {
+        if (next <= n && level.size_fenwick[next] <= remaining) {
             index = next;
-            remaining -= level.fenwick[next * 17];
+            remaining -= level.size_fenwick[next];
         }
     }
     *chunk_index = index;
@@ -156,7 +158,7 @@ std::uint32_t WaveletMatrix::rankOf(int level, std::uint32_t position,
     }
     std::uint32_t count = 0;
     for (std::size_t i = ci; i > 0; i -= lowBit(i)) {
-        count += target.fenwick[i * 17 + 1 + digit];
+        count += target.count_fenwick[i * 16 + digit];
     }
     const Chunk& chunk = target.chunks[ci];
     const std::uint32_t row = off / kRowSymbols;
@@ -190,7 +192,7 @@ std::uint32_t WaveletMatrix::locateDigitRank(int level,
     const std::uint32_t digit = chunk.digits[off];
     std::uint32_t count = 0;
     for (std::size_t i = ci; i > 0; i -= lowBit(i)) {
-        count += target.fenwick[i * 17 + 1 + digit];
+        count += target.count_fenwick[i * 16 + digit];
     }
     const std::uint32_t row = off / kRowSymbols;
     if (row > 0) {
@@ -222,18 +224,18 @@ std::uint32_t WaveletMatrix::locateAndPrefix(int level, std::uint32_t position,
             out[d] = 0;
         }
         for (std::size_t i = target.chunks.size(); i > 0; i -= lowBit(i)) {
-            const std::uint32_t* node = target.fenwick.data() + i * 17;
+            const std::uint32_t* node = target.count_fenwick.data() + i * 16;
             for (int d = 0; d < 16; ++d) {
-                out[d] += node[1 + d];
+                out[d] += node[d];
             }
         }
         return 0;
     }
     const Chunk& chunk = target.chunks[ci];
     for (std::size_t i = ci; i > 0; i -= lowBit(i)) {
-        const std::uint32_t* node = target.fenwick.data() + i * 17;
+        const std::uint32_t* node = target.count_fenwick.data() + i * 16;
         for (int d = 0; d < 16; ++d) {
-            out[d] += node[1 + d];
+            out[d] += node[d];
         }
     }
     std::uint32_t local[16];
@@ -259,9 +261,9 @@ std::uint32_t WaveletMatrix::prefixAndDigit(const Level& level,
     }
     const Chunk& chunk = level.chunks[chunk_index];
     for (std::size_t i = chunk_index; i > 0; i -= lowBit(i)) {
-        const std::uint32_t* node = level.fenwick.data() + i * 17;
+        const std::uint32_t* node = level.count_fenwick.data() + i * 16;
         for (int d = 0; d < 16; ++d) {
-            out[d] += node[1 + d];
+            out[d] += node[d];
         }
     }
     std::uint32_t local[16];
@@ -289,9 +291,9 @@ void WaveletMatrix::prefixCounts(const Level& level, std::uint32_t position,
         offset = level.chunks[chunk_index].used;
     }
     for (std::size_t i = chunk_index; i > 0; i -= lowBit(i)) {
-        const std::uint32_t* node = level.fenwick.data() + i * 17;
+        const std::uint32_t* node = level.count_fenwick.data() + i * 16;
         for (int d = 0; d < 16; ++d) {
-            out[d] += node[1 + d];
+            out[d] += node[d];
         }
     }
     std::uint32_t local[16];
