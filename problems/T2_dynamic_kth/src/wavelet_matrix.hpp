@@ -33,7 +33,7 @@ public:
 private:
     static constexpr int kLevels = 8;
     static constexpr int kChunkSymbols = 4096;   // 每块符号数
-    static constexpr int kRowSymbols = 64;      // 累计计数行粒度
+    static constexpr int kRowSymbols = 32;      // 累计计数行粒度
     static constexpr int kRows = kChunkSymbols / kRowSymbols;
     static constexpr int kSplitSize = kChunkSymbols * 3 / 4;
     static constexpr int kMergeSize = kChunkSymbols / 4;
@@ -82,6 +82,10 @@ private:
                                     int old_digit, int new_digit);
 
     // 以下三个操作均假定 (chunk_index, offset) 已由调用方定位,省去重复查找。
+    // 定位并求单个数字的前缀排名(不读取数字)。
+    std::uint32_t rankOf(int level, std::uint32_t position, int digit,
+                         std::size_t* chunk_index, std::uint32_t* offset) const;
+
     void insertDigit(int level, std::size_t chunk_index, std::uint32_t offset,
                      std::uint32_t digit);
     std::uint32_t eraseDigit(int level, std::size_t chunk_index,
@@ -93,6 +97,12 @@ private:
                                   std::size_t* chunk_index,
                                   std::uint32_t* offset,
                                   std::uint32_t out[16]) const;
+    // 一趟完成: 定位、取 position 处数字、求单个数字的前缀排名。
+    // 插入/删除/修改的路由只需单个排名,免去 16 路直方图的整段累加。
+    std::uint32_t locateDigitRank(int level, std::uint32_t position,
+                                  std::uint32_t* same_before,
+                                  std::size_t* chunk_index,
+                                  std::uint32_t* offset) const;
 
     static std::uint32_t digitOf(std::uint32_t key, int level) {
         return (key >> (28 - 4 * level)) & 0xfu;

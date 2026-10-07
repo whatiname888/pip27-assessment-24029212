@@ -144,6 +144,67 @@ std::uint32_t WaveletMatrix::digitAt(const Level& level,
     return level.chunks[chunk_index].digits[offset];
 }
 
+std::uint32_t WaveletMatrix::rankOf(int level, std::uint32_t position,
+                                    int digit, std::size_t* chunk_index,
+                                    std::uint32_t* offset) const {
+    const Level& target = levels_[level];
+    locate(target, position, chunk_index, offset);
+    const std::size_t ci = *chunk_index;
+    const std::uint32_t off = *offset;
+    if (ci >= target.chunks.size()) {
+        return target.total[digit];
+    }
+    std::uint32_t count = 0;
+    for (std::size_t i = ci; i > 0; i -= lowBit(i)) {
+        count += target.fenwick[i * 17 + 1 + digit];
+    }
+    const Chunk& chunk = target.chunks[ci];
+    const std::uint32_t row = off / kRowSymbols;
+    if (row > 0) {
+        count += chunk.rows[digit][row - 1];
+    }
+    for (std::uint32_t i = row * kRowSymbols; i < off; ++i) {
+        if (chunk.digits[i] == static_cast<std::uint32_t>(digit)) {
+            ++count;
+        }
+    }
+    return count;
+}
+
+std::uint32_t WaveletMatrix::locateDigitRank(int level,
+                                             std::uint32_t position,
+                                             std::uint32_t* same_before,
+                                             std::size_t* chunk_index,
+                                             std::uint32_t* offset) const {
+    const Level& target = levels_[level];
+    locate(target, position, chunk_index, offset);
+    std::size_t ci = *chunk_index;
+    std::uint32_t off = *offset;
+    if (ci >= target.chunks.size()) {
+        ci = target.chunks.size() - 1;
+        off = target.chunks[ci].used - 1;
+        *chunk_index = ci;
+        *offset = off;
+    }
+    const Chunk& chunk = target.chunks[ci];
+    const std::uint32_t digit = chunk.digits[off];
+    std::uint32_t count = 0;
+    for (std::size_t i = ci; i > 0; i -= lowBit(i)) {
+        count += target.fenwick[i * 17 + 1 + digit];
+    }
+    const std::uint32_t row = off / kRowSymbols;
+    if (row > 0) {
+        count += chunk.rows[digit][row - 1];
+    }
+    for (std::uint32_t i = row * kRowSymbols; i < off; ++i) {
+        if (chunk.digits[i] == digit) {
+            ++count;
+        }
+    }
+    *same_before = count;
+    return digit;
+}
+
 std::uint32_t WaveletMatrix::locateAndPrefix(int level, std::uint32_t position,
                                              std::size_t* chunk_index,
                                              std::uint32_t* offset,
@@ -347,9 +408,14 @@ void WaveletMatrix::insertDigit(int level, std::size_t chunk_index,
     std::uint16_t* digit_rows = chunk.rows[digit];
     const std::uint32_t first_row = offset / kRowSymbols;
     bumpRows(digit_rows, static_cast<int>(first_row), kRows, +1);
-    for (int g = 0; g < kRows; ++g) {
+    // 只有行边界落在 [offset, previous_used) 内的行会被挤出符号;
+    // 直接算出该小区间,避免整段扫描。
+    const std::uint32_t shift_begin = offset / kRowSymbols;
+    const std::uint32_t shift_end =
+        std::min<std::uint32_t>(kRows, previous_used / kRowSymbols);
+    for (std::uint32_t g = shift_begin; g < shift_end; ++g) {
         const std::uint32_t boundary =
-            (static_cast<std::uint32_t>(g) + 1) * kRowSymbols;
+            (g + 1) * static_cast<std::uint32_t>(kRowSymbols);
         if (boundary - 1 >= offset && boundary - 1 < previous_used) {
             --chunk.rows[chunk.digits[boundary]][g];
         }
@@ -373,9 +439,13 @@ std::uint32_t WaveletMatrix::eraseDigit(int level, std::size_t chunk_index,
     std::uint16_t* digit_rows = chunk.rows[digit];
     const std::uint32_t first_row = offset / kRowSymbols;
     bumpRows(digit_rows, static_cast<int>(first_row), kRows, -1);
-    for (int g = 0; g < kRows; ++g) {
+    const std::uint32_t shift_begin = offset / kRowSymbols;
+    const std::uint32_t shift_end =
+        std::min<std::uint32_t>(kRows, (previous_used + kRowSymbols - 1) /
+                                           kRowSymbols);
+    for (std::uint32_t g = shift_begin; g < shift_end; ++g) {
         const std::uint32_t boundary =
-            (static_cast<std::uint32_t>(g) + 1) * kRowSymbols;
+            (g + 1) * static_cast<std::uint32_t>(kRowSymbols);
         if (boundary > offset && boundary < previous_used) {
             ++chunk.rows[chunk.digits[boundary - 1]][g];
         }
@@ -417,25 +487,23 @@ void WaveletMatrix::insert(std::size_t position, int value) {
     const std::uint32_t key = keyOf(value);
     std::uint32_t p = static_cast<std::uint32_t>(position);
     for (int level = 0; level < kLevels; ++level) {
-        const std::uint32_t digit = digitOf(key, level);
-        std::uint32_t low[16];
+        const int digit = static_cast<int>(digitOf(key, level));
         std::size_t ci = 0;
         std::uint32_t off = 0;
-        if (levels_[level].chunks.empty()) {
-            std::fill(std::begin(low), std::end(low), 0);
-        } else {
-            locateAndPrefix(level, p, &ci, &off, low);
+        std::uint32_t same_before = 0;
+        if (!levels_[level].chunks.empty()) {
+            same_before = rankOf(level, p, digit, &ci, &off);
             if (ci >= levels_[level].chunks.size()) {
                 ci = levels_[level].chunks.size() - 1;
                 off = levels_[level].chunks[ci].used;
             }
         }
-        insertDigit(level, ci, off, digit);
+        insertDigit(level, ci, off, static_cast<std::uint32_t>(digit));
         std::uint32_t base = 0;
-        for (int d = 0; d < static_cast<int>(digit); ++d) {
+        for (int d = 0; d < digit; ++d) {
             base += levels_[level].total[d];
         }
-        p = base + low[digit];
+        p = base + same_before;
     }
     ++size_;
 }
@@ -443,16 +511,17 @@ void WaveletMatrix::insert(std::size_t position, int value) {
 void WaveletMatrix::erase(std::size_t position) {
     std::uint32_t p = static_cast<std::uint32_t>(position);
     for (int level = 0; level < kLevels; ++level) {
-        std::uint32_t low[16];
         std::size_t ci = 0;
         std::uint32_t off = 0;
-        const std::uint32_t digit = locateAndPrefix(level, p, &ci, &off, low);
+        std::uint32_t same_before = 0;
+        const std::uint32_t digit =
+            locateDigitRank(level, p, &same_before, &ci, &off);
         eraseDigit(level, ci, off);
         std::uint32_t base = 0;
         for (int d = 0; d < static_cast<int>(digit); ++d) {
             base += levels_[level].total[d];
         }
-        p = base + low[digit];
+        p = base + same_before;
     }
     --size_;
 }
@@ -468,20 +537,20 @@ void WaveletMatrix::replace(std::size_t position, int value) {
     std::uint32_t new_p = static_cast<std::uint32_t>(position);
     int level = 0;
     for (; level < kLevels; ++level) {
-        std::uint32_t low[16];
         std::size_t ci = 0;
         std::uint32_t off = 0;
+        std::uint32_t same_old = 0;
         const std::uint32_t old_digit =
-            locateAndPrefix(level, old_p, &ci, &off, low);
+            locateDigitRank(level, old_p, &same_old, &ci, &off);
         const std::uint32_t new_digit = digitOf(new_key, level);
         std::uint32_t base = 0;
         for (int d = 0; d < static_cast<int>(old_digit); ++d) {
             base += levels_[level].total[d];
         }
-        const std::uint32_t routed = base + low[old_digit];
+        const std::uint32_t routed = base + same_old;
         if (old_digit != new_digit) {
-            // 就地替换: 先算好两条路由,再改数字。注意替换会把旧数字的
-            // 总数减一,新符号的路由基数要按替换后的总数计算。
+            const std::uint32_t same_new =
+                rankOf(level, old_p, static_cast<int>(new_digit), &ci, &off);
             std::uint32_t base_new = 0;
             for (int d = 0; d < static_cast<int>(new_digit); ++d) {
                 base_new += levels_[level].total[d];
@@ -489,7 +558,7 @@ void WaveletMatrix::replace(std::size_t position, int value) {
             if (old_digit < new_digit) {
                 --base_new;
             }
-            const std::uint32_t routed_new = base_new + low[new_digit];
+            const std::uint32_t routed_new = base_new + same_new;
             replaceDigit(level, ci, off, old_digit, new_digit);
             old_p = routed;
             new_p = routed_new;
@@ -501,39 +570,38 @@ void WaveletMatrix::replace(std::size_t position, int value) {
     }
     for (; level < kLevels; ++level) {
         // 先删除旧符号: 路由按删除前状态计算。
-        std::uint32_t low_old[16];
         std::size_t ci_old = 0;
         std::uint32_t off_old = 0;
+        std::uint32_t same_old = 0;
         const std::uint32_t old_digit =
-            locateAndPrefix(level, old_p, &ci_old, &off_old, low_old);
+            locateDigitRank(level, old_p, &same_old, &ci_old, &off_old);
         eraseDigit(level, ci_old, off_old);
         std::uint32_t base_old = 0;
         for (int d = 0; d < static_cast<int>(old_digit); ++d) {
             base_old += levels_[level].total[d];
         }
-        const std::uint32_t routed_old = base_old + low_old[old_digit];
+        const std::uint32_t routed_old = base_old + same_old;
         // routed_new 就是新符号在本层"最终序列"中的下标,而最终序列恰为
         // "删除旧符号后的序列 + 在此下标插入新符号",故直接在此插入即可。
-        const std::uint32_t new_digit = digitOf(new_key, level);
-        std::uint32_t low_new[16];
+        const int new_digit = static_cast<int>(digitOf(new_key, level));
         std::size_t ci_new = 0;
         std::uint32_t off_new = 0;
-        if (levels_[level].chunks.empty()) {
-            std::fill(std::begin(low_new), std::end(low_new), 0);
-        } else {
-            locateAndPrefix(level, new_p, &ci_new, &off_new, low_new);
+        std::uint32_t same_new = 0;
+        if (!levels_[level].chunks.empty()) {
+            same_new = rankOf(level, new_p, new_digit, &ci_new, &off_new);
             if (ci_new >= levels_[level].chunks.size()) {
                 ci_new = levels_[level].chunks.size() - 1;
                 off_new = levels_[level].chunks[ci_new].used;
             }
         }
-        insertDigit(level, ci_new, off_new, new_digit);
+        insertDigit(level, ci_new, off_new,
+                    static_cast<std::uint32_t>(new_digit));
         std::uint32_t base_new = 0;
-        for (int d = 0; d < static_cast<int>(new_digit); ++d) {
+        for (int d = 0; d < new_digit; ++d) {
             base_new += levels_[level].total[d];
         }
         old_p = routed_old;
-        new_p = base_new + low_new[new_digit];
+        new_p = base_new + same_new;
     }
 }
 
