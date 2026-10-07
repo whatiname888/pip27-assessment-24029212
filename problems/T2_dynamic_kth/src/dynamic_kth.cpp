@@ -4,6 +4,7 @@
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
+#include <cstring>
 #include <functional>
 #include <memory>
 #include <vector>
@@ -52,6 +53,8 @@ struct DynamicKth::Impl {
     };
 
     std::vector<Block> blocks_;
+    // 各块长度的连续数组：定位行走顺序扫描，不再逐块解引用。
+    std::vector<std::uint32_t> block_sizes_;
     std::size_t length_ = 0;
     int bucket_count_ = 256;
     std::size_t block_target_ = 256;
@@ -83,7 +86,9 @@ struct DynamicKth::Impl {
         const double root = std::sqrt(static_cast<double>(scale));
         block_target_ = static_cast<std::size_t>(
             clampInt(static_cast<int>(2.75 * root), 256, 8192));
-        bucket_count_ = clampInt(static_cast<int>(root), 64, 4096);
+        // 桶数权衡: 桶扫描代价 ~2W, 候选选择代价 ~N/W, 取 W ~ 0.75*sqrt(N);
+        // 偏小的桶数同时让桶前缀和与 offsets 表更小、更易驻留缓存。
+        bucket_count_ = clampInt(static_cast<int>(root), 128, 2560);
         dirty_.assign(static_cast<std::size_t>(bucket_count_), 1);
         partial_counts_.assign(static_cast<std::size_t>(bucket_count_), 0);
 
@@ -162,7 +167,16 @@ struct DynamicKth::Impl {
 
     void markAllDirty() { std::fill(dirty_.begin(), dirty_.end(), 1); }
 
+    void refreshBlockSizes() {
+        block_sizes_.resize(blocks_.size());
+        for (std::size_t i = 0; i < blocks_.size(); ++i) {
+            block_sizes_[i] =
+                static_cast<std::uint32_t>(blocks_[i].values.size());
+        }
+    }
+
     void resizePrefix() {
+        refreshBlockSizes();
         const std::size_t rows = blocks_.size() + 1;
         prefix_.assign(static_cast<std::size_t>(bucket_count_) * rows, 0);
         markAllDirty();
@@ -290,6 +304,7 @@ struct DynamicKth::Impl {
             offset = blocks_[block_index].values.size();
         }
         blockInsert(&blocks_[block_index], offset, value);
+        ++block_sizes_[block_index];
         ++length_;
         markBucketDirty(bucketOf(value));
         if (blocks_[block_index].values.size() > 2 * block_target_) {
@@ -304,6 +319,7 @@ struct DynamicKth::Impl {
         Block& block = blocks_[block_index];
         const int value = block.values[offset];
         blockErase(&block, offset);
+        --block_sizes_[block_index];
         --length_;
         markBucketDirty(bucketOf(value));
         if (block.values.size() * 2 < block_target_) {
@@ -319,8 +335,8 @@ struct DynamicKth::Impl {
         std::size_t right_offset = 0;
         {
             std::size_t start = 0;
-            for (std::size_t i = 0; i < blocks_.size(); ++i) {
-                const std::size_t size = blocks_[i].values.size();
+            for (std::size_t i = 0; i < block_sizes_.size(); ++i) {
+                const std::size_t size = block_sizes_[i];
                 if (left - start < size) {
                     left_block = i;
                     left_offset = left - start;
@@ -337,14 +353,18 @@ struct DynamicKth::Impl {
         // 查询区间落在同一块内：直接扫描小段，不经过值域桶。
         if (left_block == right_block) {
             const Block& block = blocks_[left_block];
-            candidates_.assign(
-                block.values.begin() + static_cast<std::ptrdiff_t>(left_offset),
-                block.values.begin() + static_cast<std::ptrdiff_t>(right_offset) + 1);
+            const std::size_t length = right_offset - left_offset + 1;
+            if (candidates_.size() < length) {
+                candidates_.resize(length);
+            }
+            std::memcpy(candidates_.data(),
+                        block.values.data() + left_offset,
+                        length * sizeof(int));
             const std::size_t index = k - 1;
-            std::nth_element(candidates_.begin(),
-                             candidates_.begin() +
-                                 static_cast<std::ptrdiff_t>(index),
-                             candidates_.end(), std::greater<int>());
+            std::nth_element(candidates_.data(),
+                             candidates_.data() + index,
+                             candidates_.data() + length,
+                             std::greater<int>());
             return candidates_[index];
         }
 
@@ -352,7 +372,7 @@ struct DynamicKth::Impl {
         // 直接交给桶前缀和处理，避免逐元素扫描整块。
         partial_.clear();
         std::fill(partial_counts_.begin(), partial_counts_.end(), 0);
-        const std::size_t tail_length = blocks_[right_block].values.size();
+        const std::size_t tail_length = block_sizes_[right_block];
         const bool head_scanned = left_offset != 0;
         const bool tail_scanned = right_offset + 1 != tail_length;
         if (head_scanned) {
@@ -398,32 +418,36 @@ struct DynamicKth::Impl {
             skipped += count;
         }
 
-        // 收集候选：整块用 offsets 取出目标桶的有序子段。规模异常偏大时
-        // （数据值域分布极不均匀）改为在目标桶内二分答案兜底。
-        candidates_.clear();
+        // 收集候选：整块用 offsets 取出目标桶的有序子段。逐块调用容器接口
+        // 的固定开销在几千个块上不可忽略，改用原始指针连续写入。
+        if (candidates_.size() < kMaxCandidates + 16) {
+            candidates_.resize(kMaxCandidates + 16);
+        }
+        int* const output = candidates_.data();
+        std::size_t count = 0;
         for (int value : partial_) {
             if (bucketOf(value) == target_bucket) {
-                candidates_.push_back(value);
+                output[count++] = value;
             }
         }
         for (std::size_t i = first_full; i <= last_full; ++i) {
-            if (i + 2 <= last_full) {
-                // 提前预取后续块的 offsets 与有序数组。
-                prefetchBlock(blocks_[i + 2].offsets.data() +
+            if (i + 4 <= last_full) {
+                // 提前预取后续块的 offsets 与有序数组,隐藏逐块访存延迟。
+                prefetchBlock(blocks_[i + 4].offsets.data() +
                               static_cast<std::size_t>(target_bucket));
-                prefetchBlock(blocks_[i + 2].sorted.data());
+                prefetchBlock(blocks_[i + 4].sorted.data());
             }
             const Block& block = blocks_[i];
             const std::size_t begin =
                 block.offsets[static_cast<std::size_t>(target_bucket)];
             const std::size_t end =
                 block.offsets[static_cast<std::size_t>(target_bucket) + 1];
-            candidates_.insert(candidates_.end(),
-                               block.sorted.begin() +
-                                   static_cast<std::ptrdiff_t>(begin),
-                               block.sorted.begin() +
-                                   static_cast<std::ptrdiff_t>(end));
-            if (candidates_.size() > kMaxCandidates) {
+            const int* source = block.sorted.data() + begin;
+            const int* finish = block.sorted.data() + end;
+            while (source < finish) {
+                output[count++] = *source++;
+            }
+            if (count > kMaxCandidates) {
                 return kthInBucketByBinarySearch(partial_, first_full,
                                                  last_full, target_bucket,
                                                  rank_in_bucket);
@@ -431,10 +455,9 @@ struct DynamicKth::Impl {
         }
 
         const std::size_t index = rank_in_bucket - 1;
-        std::nth_element(candidates_.begin(),
-                         candidates_.begin() + static_cast<std::ptrdiff_t>(index),
-                         candidates_.end(), std::greater<int>());
-        return candidates_[index];
+        std::nth_element(output, output + index, output + count,
+                         std::greater<int>());
+        return output[index];
     }
 
     // 候选规模过大时的兜底：在目标桶的有序子段上二分答案，只做计数。
