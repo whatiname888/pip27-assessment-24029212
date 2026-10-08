@@ -33,7 +33,7 @@ public:
 private:
     static constexpr int kLevels = 8;
     static constexpr int kChunkSymbols = 4096;   // 每块符号数
-    static constexpr int kRowSymbols = 32;      // 累计计数行粒度
+    static constexpr int kRowSymbols = 128;      // 累计计数行粒度
     static constexpr int kRows = kChunkSymbols / kRowSymbols;
     static constexpr int kSplitSize = kChunkSymbols * 3 / 4;
     static constexpr int kMergeSize = kChunkSymbols / 4;
@@ -41,10 +41,11 @@ private:
     struct Chunk {
         std::uint16_t used = 0;
         std::uint8_t digits[kChunkSymbols] = {0};
-        // rows[d][g] = 前 (g+1)*kRowSymbols 个数字中数字 d 的个数。
-        // 按数字优先存放: 插入/删除要给某数字的所有后续行增减计数,
-        // 转置后是连续内存,可用紧凑循环乃至向量化。
-        std::uint16_t rows[16][kRows] = {{0}};
+        // rows[g][d] = 前 (g+1)*kRowSymbols 个数字中数字 d 的个数(行主序)。
+        // 行主序让两处热路径都顺序访存: 查询读一整行是连续 32 字节,
+        // 修改的后缀增减与跨行修正沿行号单向扫描——小 L2 机器上散射
+        // 访问的缓存缺失是主要开销,顺序访问可被预取器吸收。
+        std::uint16_t rows[kRows][16] = {{0}};
     };
 
     struct Level {

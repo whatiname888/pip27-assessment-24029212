@@ -14,24 +14,6 @@ inline std::uint32_t lowBit(std::size_t value) {
     return static_cast<std::uint32_t>(value & ~(value - 1));
 }
 
-// 累计行的计数不超过块容量(<=4096),可用 64 位打包并行增减:
-// 一条指令同时给 4 个 uint16 计数加减 1。
-inline void bumpRows(std::uint16_t* rows, int from, int to, int delta) {
-    // 每个 16 位槽同时加减 1。槽值不会回绕: 递增时计数 <= 块容量,
-    // 递减时被改符号本就计入该行、计数 >= 1,不会跨槽借位。
-    constexpr std::uint64_t kLanes = 0x0001000100010001ULL;
-    int g = from;
-    for (; g + 4 <= to; g += 4) {
-        std::uint64_t packed;
-        std::memcpy(&packed, rows + g, sizeof packed);
-        packed = delta > 0 ? packed + kLanes : packed - kLanes;
-        std::memcpy(rows + g, &packed, sizeof packed);
-    }
-    for (; g < to; ++g) {
-        rows[g] = static_cast<std::uint16_t>(rows[g] + delta);
-    }
-}
-
 }  // namespace
 
 void WaveletMatrix::rebuildChunk(Chunk* chunk) {
@@ -45,7 +27,7 @@ void WaveletMatrix::rebuildChunk(Chunk* chunk) {
             ++running[chunk->digits[i]];
         }
         for (int d = 0; d < 16; ++d) {
-            chunk->rows[d][g] = static_cast<std::uint16_t>(running[d]);
+            chunk->rows[g][d] = static_cast<std::uint16_t>(running[d]);
         }
     }
 }
@@ -60,8 +42,9 @@ void WaveletMatrix::chunkPrefix(const Chunk& chunk, std::uint32_t count,
     }
     const std::uint32_t full_rows = (count - 1) / kRowSymbols;
     if (full_rows > 0) {
+        const std::uint16_t* row = chunk.rows[full_rows - 1];
         for (int d = 0; d < 16; ++d) {
-            out[d] = chunk.rows[d][full_rows - 1];
+            out[d] = row[d];
         }
     }
     for (std::uint32_t i = full_rows * kRowSymbols; i < count; ++i) {
@@ -76,8 +59,9 @@ void WaveletMatrix::fenwickRebuild(Level* level) {
     for (std::size_t i = 0; i < n; ++i) {
         level->size_fenwick[i + 1] = level->chunks[i].used;
         std::uint32_t* node = level->count_fenwick.data() + (i + 1) * 16;
+        const std::uint16_t* row = level->chunks[i].rows[kRows - 1];
         for (int d = 0; d < 16; ++d) {
-            node[d] = level->chunks[i].rows[d][kRows - 1];
+            node[d] = row[d];
         }
     }
     for (std::size_t i = 1; i <= n; ++i) {
@@ -163,7 +147,7 @@ std::uint32_t WaveletMatrix::rankOf(int level, std::uint32_t position,
     const Chunk& chunk = target.chunks[ci];
     const std::uint32_t row = off / kRowSymbols;
     if (row > 0) {
-        count += chunk.rows[digit][row - 1];
+        count += chunk.rows[row - 1][digit];
     }
     for (std::uint32_t i = row * kRowSymbols; i < off; ++i) {
         if (chunk.digits[i] == static_cast<std::uint32_t>(digit)) {
@@ -196,7 +180,7 @@ std::uint32_t WaveletMatrix::locateDigitRank(int level,
     }
     const std::uint32_t row = off / kRowSymbols;
     if (row > 0) {
-        count += chunk.rows[digit][row - 1];
+        count += chunk.rows[row - 1][digit];
     }
     for (std::uint32_t i = row * kRowSymbols; i < off; ++i) {
         if (chunk.digits[i] == digit) {
@@ -354,9 +338,12 @@ void WaveletMatrix::replaceDigit(int level, std::size_t chunk_index,
     Chunk& chunk = target.chunks[chunk_index];
     chunk.digits[offset] = static_cast<std::uint8_t>(new_digit);
     // 累计行只需改两种数字的计数。
-    const int first_row = static_cast<int>(offset / kRowSymbols);
-    bumpRows(chunk.rows[old_digit], first_row, kRows, -1);
-    bumpRows(chunk.rows[new_digit], first_row, kRows, +1);
+    const std::uint32_t first_row = offset / kRowSymbols;
+    for (std::uint32_t g = first_row; g < kRows; ++g) {
+        std::uint16_t* row = chunk.rows[g];
+        --row[old_digit];
+        ++row[new_digit];
+    }
     fenwickReplaceDigit(&target, chunk_index, static_cast<int>(old_digit),
                         static_cast<int>(new_digit));
     --target.total[old_digit];
@@ -406,20 +393,15 @@ void WaveletMatrix::insertDigit(int level, std::size_t chunk_index,
     chunk.digits[offset] = static_cast<std::uint8_t>(digit);
     ++chunk.used;
     // 累计行更新: 新数字计入所有包含它的行; 被后移挤出某行上界的那个
-    // 符号要从该行扣除,否则行计数会虚增。
-    std::uint16_t* digit_rows = chunk.rows[digit];
+    // 符号要从该行扣除。一趟行扫描同时完成两件事,顺序访存。
     const std::uint32_t first_row = offset / kRowSymbols;
-    bumpRows(digit_rows, static_cast<int>(first_row), kRows, +1);
-    // 只有行边界落在 [offset, previous_used) 内的行会被挤出符号;
-    // 直接算出该小区间,避免整段扫描。
-    const std::uint32_t shift_begin = offset / kRowSymbols;
-    const std::uint32_t shift_end =
-        std::min<std::uint32_t>(kRows, previous_used / kRowSymbols);
-    for (std::uint32_t g = shift_begin; g < shift_end; ++g) {
+    for (std::uint32_t g = first_row; g < kRows; ++g) {
+        std::uint16_t* row = chunk.rows[g];
+        ++row[digit];
         const std::uint32_t boundary =
             (g + 1) * static_cast<std::uint32_t>(kRowSymbols);
         if (boundary - 1 >= offset && boundary - 1 < previous_used) {
-            --chunk.rows[chunk.digits[boundary]][g];
+            --row[chunk.digits[boundary]];
         }
     }
     fenwickAdd(&target, chunk_index, static_cast<int>(digit), 1);
@@ -438,18 +420,14 @@ std::uint32_t WaveletMatrix::eraseDigit(int level, std::size_t chunk_index,
     }
     --chunk.used;
     // 删除同理: 被前移拉进某行上界内的符号要补回该行。
-    std::uint16_t* digit_rows = chunk.rows[digit];
     const std::uint32_t first_row = offset / kRowSymbols;
-    bumpRows(digit_rows, static_cast<int>(first_row), kRows, -1);
-    const std::uint32_t shift_begin = offset / kRowSymbols;
-    const std::uint32_t shift_end =
-        std::min<std::uint32_t>(kRows, (previous_used + kRowSymbols - 1) /
-                                           kRowSymbols);
-    for (std::uint32_t g = shift_begin; g < shift_end; ++g) {
+    for (std::uint32_t g = first_row; g < kRows; ++g) {
+        std::uint16_t* row = chunk.rows[g];
+        --row[digit];
         const std::uint32_t boundary =
             (g + 1) * static_cast<std::uint32_t>(kRowSymbols);
         if (boundary > offset && boundary < previous_used) {
-            ++chunk.rows[chunk.digits[boundary - 1]][g];
+            ++row[chunk.digits[boundary - 1]];
         }
     }
     fenwickAdd(&target, chunk_index, static_cast<int>(digit), -1);
