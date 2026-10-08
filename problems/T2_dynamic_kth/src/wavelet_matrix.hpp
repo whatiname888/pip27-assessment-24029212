@@ -2,6 +2,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <deque>
 #include <vector>
 
 namespace pip27 {
@@ -32,7 +33,7 @@ public:
 
 private:
     static constexpr int kLevels = 8;
-    static constexpr int kChunkSymbols = 4096;   // 每块符号数
+    static constexpr int kChunkSymbols = 2048;   // 每块符号数
     static constexpr int kRowSymbols = 128;      // 累计计数行粒度
     static constexpr int kRows = kChunkSymbols / kRowSymbols;
     static constexpr int kSplitSize = kChunkSymbols * 3 / 4;
@@ -49,7 +50,9 @@ private:
     };
 
     struct Level {
-        std::vector<Chunk> chunks;
+        // deque: 拆块/并块在中间插入删除只搬指针块,不搬数据本体。
+        // 小块化后拆块频繁,若用 vector 会反复整层搬移,得不偿失。
+        std::deque<Chunk> chunks;
         // 两条扁平 Fenwick: 紧凑的符号数(定位用,常驻一二级缓存)、
         // 16 路数字计数(前缀计数用)。定位走紧凑数组,缓存足迹从
         // 数十 KB 降到数 KB,是查询与更新共同的热路径。

@@ -370,9 +370,7 @@ void WaveletMatrix::insertDigit(int level, std::size_t chunk_index,
         const std::uint32_t half = kChunkSymbols / 2;
         Chunk& head = target.chunks[chunk_index];
         tail.used = static_cast<std::uint16_t>(head.used - half);
-        for (std::uint32_t i = 0; i < tail.used; ++i) {
-            tail.digits[i] = head.digits[half + i];
-        }
+        std::memcpy(tail.digits, head.digits + half, tail.used);
         head.used = half;
         rebuildChunk(&head);
         rebuildChunk(&tail);
@@ -387,9 +385,10 @@ void WaveletMatrix::insertDigit(int level, std::size_t chunk_index,
     }
     Chunk& chunk = target.chunks[chunk_index];
     const std::uint32_t previous_used = chunk.used;
-    for (std::uint32_t i = chunk.used; i > offset; --i) {
-        chunk.digits[i] = chunk.digits[i - 1];
-    }
+    // 块内搬移用 memmove: 逐字节循环在部分编译器上无法向量化,
+    // 而这是修改路径最大的内存流量来源。
+    std::memmove(chunk.digits + offset + 1, chunk.digits + offset,
+                 chunk.used - offset);
     chunk.digits[offset] = static_cast<std::uint8_t>(digit);
     ++chunk.used;
     // 累计行更新: 新数字计入所有包含它的行; 被后移挤出某行上界的那个
@@ -415,9 +414,8 @@ std::uint32_t WaveletMatrix::eraseDigit(int level, std::size_t chunk_index,
     Chunk& chunk = target.chunks[chunk_index];
     const std::uint32_t digit = chunk.digits[offset];
     const std::uint32_t previous_used = chunk.used;
-    for (std::uint32_t i = offset; i + 1 < chunk.used; ++i) {
-        chunk.digits[i] = chunk.digits[i + 1];
-    }
+    std::memmove(chunk.digits + offset, chunk.digits + offset + 1,
+                 chunk.used - offset - 1);
     --chunk.used;
     // 删除同理: 被前移拉进某行上界内的符号要补回该行。
     const std::uint32_t first_row = offset / kRowSymbols;
@@ -438,9 +436,7 @@ std::uint32_t WaveletMatrix::eraseDigit(int level, std::size_t chunk_index,
         if (chunk_index + 1 < target.chunks.size() &&
             chunk.used + target.chunks[chunk_index + 1].used <= kChunkSymbols) {
             Chunk& next = target.chunks[chunk_index + 1];
-            for (std::uint32_t i = 0; i < next.used; ++i) {
-                chunk.digits[chunk.used + i] = next.digits[i];
-            }
+            std::memcpy(chunk.digits + chunk.used, next.digits, next.used);
             chunk.used += next.used;
             rebuildChunk(&chunk);
             target.chunks.erase(target.chunks.begin() +
@@ -450,9 +446,8 @@ std::uint32_t WaveletMatrix::eraseDigit(int level, std::size_t chunk_index,
                    chunk.used + target.chunks[chunk_index - 1].used <=
                        kChunkSymbols) {
             Chunk& previous = target.chunks[chunk_index - 1];
-            for (std::uint32_t i = 0; i < chunk.used; ++i) {
-                previous.digits[previous.used + i] = chunk.digits[i];
-            }
+            std::memcpy(previous.digits + previous.used, chunk.digits,
+                        chunk.used);
             previous.used += chunk.used;
             rebuildChunk(&previous);
             target.chunks.erase(target.chunks.begin() +
